@@ -11,6 +11,7 @@ local utils = require("kong.tools.utils")
 local openssl_x509 = require("resty.openssl.x509")
 local system_constants = require("lua_system_constants")
 local ffi = require("ffi")
+local string = string
 local assert = assert
 local setmetatable = setmetatable
 local type = type
@@ -36,13 +37,17 @@ local deflate_gzip = utils.deflate_gzip
 
 local MAX_PAYLOAD = 4 * 1024 * 1024 -- 4MB
 local PING_INTERVAL = 30 -- 30 seconds
+local PING_WAIT = PING_INTERVAL * 1.5
 local WS_OPTS = {
   timeout = 5000,
   max_payload_len = MAX_PAYLOAD,
 }
+local ngx_OK = ngx.OK
 local ngx_ERR = ngx.ERR
+local ngx_WARN = ngx.WARN
 local ngx_DEBUG = ngx.DEBUG
 local ngx_INFO = ngx.INFO
+local ngx_NOTICE = ngx.NOTICE
 local WEAK_KEY_MT = { __mode = "k", }
 local CERT_DIGEST
 local CERT, CERT_KEY
@@ -99,6 +104,11 @@ local function update_config(config_table, update_cache)
 end
 
 
+local function is_timeout(err)
+  return err and string.sub(err, -7) == "timeout"
+end
+
+
 local function send_ping(c)
   local hash = declarative.get_current_hash()
 
@@ -108,14 +118,10 @@ local function send_ping(c)
 
   local _, err = c:send_ping(hash)
   if err then
-    ngx_log(ngx_ERR, "unable to ping control plane node: ", err)
-    -- return and let the main thread handle the error
-    return nil
+    ngx_log(is_timeout(err) and ngx_NOTICE or ngx_WARN, "unable to ping control plane node: ", err)
   end
 
   ngx_log(ngx_DEBUG, "sent PING packet to control plane")
-
-  return true
 end
 
 
@@ -151,7 +157,7 @@ local function communicate(premature, conf)
     local delay = math.random(5, 10)
 
     ngx_log(ngx_ERR, "connection to control plane ", uri, " broken: ", err,
-            " retrying after ", delay , " seconds")
+                     " retrying after ", delay , " seconds")
     assert(ngx.timer.at(delay, communicate, conf))
     return
   end
@@ -159,12 +165,9 @@ local function communicate(premature, conf)
   local update_config_semaphore = semaphore.new(0)
 
   -- connection established
-  -- ping thread
-  ngx.thread.spawn(function()
+  local ping_thread = ngx.thread.spawn(function()
     while not exiting() do
-      if not send_ping(c) then
-        return
-      end
+      send_ping(c)
 
       for _ = 1, PING_INTERVAL do
         ngx_sleep(1)
@@ -175,8 +178,7 @@ local function communicate(premature, conf)
     end
   end)
 
-  -- update config thread
-  ngx.thread.spawn(function()
+  local update_thread = ngx.thread.spawn(function()
     while not exiting() do
       local ok, err = update_config_semaphore:wait(1)
       if ok then
@@ -204,38 +206,58 @@ local function communicate(premature, conf)
     end
   end)
 
-  while not exiting() do
-    local data, typ, err = c:recv_frame()
-    if err then
-      ngx.log(ngx.ERR, "error while receiving frame from control plane: ", err)
-      c:close()
-
-      local delay = 9 + math.random()
-      assert(ngx.timer.at(delay, communicate, conf))
-      return
-    end
-
-    if typ == "binary" then
-      data = assert(inflate_gzip(data))
-
-      local msg = assert(cjson_decode(data))
-
-      if msg.type == "reconfigure" then
-        next_config = assert(msg.config_table)
-
-        if update_config_semaphore:count() <= 0 then
-          -- the following line always executes immediately after the `if` check
-          -- because `:count` will never yield, end result is that the semaphore
-          -- count is guaranteed to not exceed 1
-          update_config_semaphore:post()
+  local main_thread = ngx.thread.spawn(function()
+    while not exiting() do
+      local data, typ, err = c:recv_frame()
+      if err then
+        if not is_timeout(err) then
+          return nil, "error while receiving frame from control plane: " .. err
         end
 
-        send_ping(c)
-      end
+      else
+        if typ == "binary" then
+          data = assert(inflate_gzip(data))
 
-    elseif typ == "pong" then
-      ngx_log(ngx_DEBUG, "received PONG frame from control plane")
+          local msg = assert(cjson_decode(data))
+
+          if msg.type == "reconfigure" then
+            next_config = assert(msg.config_table)
+
+            if update_config_semaphore:count() <= 0 then
+              -- the following line always executes immediately after the `if` check
+              -- because `:count` will never yield, end result is that the semaphore
+              -- count is guaranteed to not exceed 1
+              update_config_semaphore:post()
+            end
+
+            send_ping(c)
+          end
+
+        elseif typ == "pong" then
+          ngx_log(ngx_DEBUG, "received PONG frame from control plane")
+
+        elseif typ == "close" then
+          return
+        end
+      end
     end
+  end)
+
+  local _, err = ngx.thread.wait(main_thread, update_thread, ping_thread)
+
+  ngx.thread.kill(main_thread)
+  ngx.thread.kill(update_thread)
+  ngx.thread.kill(ping_thread)
+
+  c:close()
+
+  if err then
+    ngx_log(ngx_ERR, err)
+  end
+
+  if not exiting() then
+    local delay = 9 + math.random()
+    assert(ngx.timer.at(delay, communicate, conf))
   end
 end
 
@@ -304,68 +326,117 @@ function _M.handle_cp_websocket()
   end
 
   -- connection established
-  -- ping thread
-  ngx.thread.spawn(function()
+  local ping_thread = ngx.thread.spawn(function()
+    local last_seen = ngx_time()
     while not exiting() do
       local data, typ, err = wb:recv_frame()
-      if not data then
-        ngx_log(ngx_ERR, "did not receive ping frame from data plane: ", err)
-        return ngx_exit(ngx_ERR)
+
+      if exiting() then
+        return
       end
 
-      assert(typ == "ping")
+      if err then
+        if not is_timeout(err) then
+          return nil, err
+        end
 
-      -- queue PONG to avoid races
-      table_insert(queue, "PONG")
-      queue.sem:post()
+        local waited = ngx_time() - last_seen
+        if waited > PING_WAIT then
+          return nil, "did not receive ping frame from data plane within " .. PING_WAIT .. " seconds"
+        end
 
-      local ok
-      ok, err = kong.db.clustering_data_planes:upsert({ id = node_id, }, {
-        last_seen = ngx_time(),
-        config_hash =
-          data ~= "" and data or nil,
-        hostname = node_hostname,
-        ip = node_ip,
-      }, { ttl = kong.configuration.cluster_data_plane_purge_delay, })
-      if not ok then
-        ngx_log(ngx_ERR, "unable to update clustering data plane status: ", err)
+      else
+        if typ == "close" then
+          return
+        end
+
+        if not data then
+          return nil, "did not receive ping frame from data plane"
+        end
+
+        -- dps only send pings
+        if typ ~= "ping" then
+          return nil, "invalid websocket frame received from a data plane: " .. typ
+        end
+
+        -- queue PONG to avoid races
+        table_insert(queue, "PONG")
+        queue.sem:post()
+
+        last_seen = ngx_time()
+
+        local ok
+        ok, err = kong.db.clustering_data_planes:upsert({ id = node_id, }, {
+          last_seen = last_seen,
+          config_hash = data ~= "" and data or nil,
+          hostname = node_hostname,
+          ip = node_ip,
+        }, { ttl = kong.configuration.cluster_data_plane_purge_delay, })
+        if not ok then
+          ngx_log(ngx_ERR, "unable to update clustering data plane status: ", err)
+        end
       end
     end
   end)
 
-  while not exiting() do
-    local ok, err = sem:wait(5)
-    if exiting() then
-      return
-    end
-    if ok then
-      local payload = table_remove(queue, 1)
-      assert(payload, "config queue can not be empty after semaphore returns")
-
-      if payload == "PONG" then
-        local _
-        _, err = wb:send_pong()
-        if err then
-          ngx_log(ngx_ERR, "failed to send PONG back to data plane: ", err)
-          return ngx_exit(ngx_ERR)
-        end
-
-        ngx_log(ngx_DEBUG, "sent PONG packet to data plane")
-
-      else -- config update
-        local _, err = wb:send_binary(payload)
-        if err then
-          ngx_log(ngx_ERR, "unable to send updated configuration to node: ", err)
-
-        else
-          ngx_log(ngx_DEBUG, "sent config update to node")
-        end
+  local main_thread = ngx.thread.spawn(function()
+    while not exiting() do
+      local ok, err = sem:wait(5)
+      if exiting() then
+        return
       end
+      if ok then
+        local payload = table_remove(queue, 1)
+        if not payload then
+          return nil, "config queue can not be empty after semaphore returns"
+        end
 
-    elseif err ~= "timeout" then
-      ngx_log(ngx_ERR, "semaphore wait error: ", err)
+        if payload == "PONG" then
+          local _, err = wb:send_pong()
+          if err then
+            if not is_timeout(err) then
+              return nil, "failed to send PONG back to data plane: " .. err
+            end
+
+            ngx_log(ngx_NOTICE, "failed to send PONG back to data plane: ", err)
+
+          else
+            ngx_log(ngx_DEBUG, "sent PONG packet to data plane")
+          end
+
+        else -- config update
+          local _, err = wb:send_binary(payload)
+          if err then
+            if not is_timeout(err) then
+              return nil, "unable to send updated configuration to node: " .. err
+            end
+
+            ngx_log(ngx_NOTICE, "unable to send updated configuration to node: ", err)
+
+          else
+            ngx_log(ngx_DEBUG, "sent config update to node")
+          end
+        end
+
+      elseif err ~= "timeout" then
+        return nil, "semaphore wait error: " .. err
+      end
     end
+  end)
+
+  local _, err = ngx.thread.wait(main_thread, ping_thread)
+
+  ngx.thread.kill(main_thread)
+  ngx.thread.kill(ping_thread)
+
+  wb:send_close()
+
+  if err then
+    ngx_log(ngx_ERR, err)
+    return ngx_exit(ngx_ERR)
   end
+
+  return ngx_exit(ngx_OK)
 end
 
 
