@@ -34,6 +34,7 @@ local cipher_suites = {
                          .. "ECDHE-RSA-CHACHA20-POLY1305:"
                          .. "DHE-RSA-AES128-GCM-SHA256:"
                          .. "DHE-RSA-AES256-GCM-SHA384",
+                 dhparams = "ffdhe2048",
     prefer_server_ciphers = "off",
   },
                       old = {
@@ -836,6 +837,14 @@ local function check_and_infer(conf, opts)
       conf.nginx_http_ssl_prefer_server_ciphers = suite.prefer_server_ciphers
       conf.nginx_stream_ssl_protocols = suite.protocols
       conf.nginx_stream_ssl_prefer_server_ciphers = suite.prefer_server_ciphers
+
+      -- there is no secure predefined one for old at the moment (and is too slow to generate)
+      -- intermediate (the default) forcibly sets this to predefined ffdhe2048 group
+      -- modern just forcibly sets this to nil as there are no ciphers that need it
+      if conf.ssl_cipher_suite ~= "old" then
+        conf.nginx_http_ssl_dhparam = suite.dhparams
+        conf.nginx_stream_ssl_dhparam = suite.dhparams
+      end
 
     else
       errors[#errors + 1] = "Undefined cipher suite " .. tostring(conf.ssl_cipher_suite)
