@@ -185,7 +185,7 @@ for _, consistency in ipairs(bu.consistencies) do
 
         -- modify weight for target 2, set to 0
         bu.begin_testcase_setup_update(strategy, bp)
-        bu.add_target(bp, upstream_id, "127.0.0.1", port2, {
+        bu.update_target(bp, upstream_id, "127.0.0.1", port2, {
           weight = 0, -- disable this target
         })
         bu.end_testcase_setup(strategy, bp, consistency)
@@ -234,7 +234,7 @@ for _, consistency in ipairs(bu.consistencies) do
 
         -- modify weight for target 2
         bu.begin_testcase_setup_update(strategy, bp)
-        bu.add_target(bp, upstream_id, "127.0.0.1", port2, {
+        bu.update_target(bp, upstream_id, "127.0.0.1", port2, {
           weight = 15,   -- shift proportions from 50/50 to 40/60
         })
         bu.end_testcase_setup(strategy, bp, consistency)
@@ -287,8 +287,8 @@ for _, consistency in ipairs(bu.consistencies) do
 
         -- modify weight for both targets, set to 0
         bu.begin_testcase_setup_update(strategy, bp)
-        bu.add_target(bp, upstream_id, "127.0.0.1", port1, { weight = 0 })
-        bu.add_target(bp, upstream_id, "127.0.0.1", port2, { weight = 0 })
+        bu.update_target(bp, upstream_id, "127.0.0.1", port1, { weight = 0 })
+        bu.update_target(bp, upstream_id, "127.0.0.1", port2, { weight = 0 })
         bu.end_testcase_setup(strategy, bp, consistency)
 
         -- now go and hit the same balancer again
@@ -354,7 +354,7 @@ for _, consistency in ipairs(bu.consistencies) do
 
           -- remove target
           bu.begin_testcase_setup_update(strategy, bp)
-          bu.add_target(bp, upstream_id, localhost, port, {
+          bu.update_target(bp, upstream_id, localhost, port, {
             weight = 0,
           })
           bu.end_testcase_setup(strategy, bp, consistency)
@@ -367,7 +367,7 @@ for _, consistency in ipairs(bu.consistencies) do
 
           -- add the target back with same weight as initial weight
           bu.begin_testcase_setup_update(strategy, bp)
-          bu.add_target(bp, upstream_id, localhost, port, {
+          bu.update_target(bp, upstream_id, localhost, port, {
             weight = 100,
           })
           bu.end_testcase_setup(strategy, bp, consistency)

@@ -191,6 +191,7 @@ local get_balancer_health
 local post_target_address_health
 local get_router_version
 local add_target
+local update_target
 local add_api
 local patch_api
 local gen_port
@@ -330,6 +331,16 @@ do
     req.weight = req.weight or 10
     req.upstream = { id = upstream_id }
     bp.targets:insert(req)
+    return port
+  end
+
+  update_target = function(bp, upstream_id, host, port, data)
+    port = port or gen_port()
+    local req = utils.deep_copy(data) or {}
+    req.target = req.target or utils.format_host(host, port)
+    req.weight = req.weight or 10
+    req.upstream = { id = upstream_id }
+    bp.targets:update(req.id or req.target, req)
     return port
   end
 
@@ -553,6 +564,7 @@ local balancer_utils = {}
 --balancer_utils.
 balancer_utils.add_api = add_api
 balancer_utils.add_target = add_target
+balancer_utils.update_target = update_target
 balancer_utils.add_upstream = add_upstream
 balancer_utils.remove_upstream = remove_upstream
 balancer_utils.begin_testcase_setup = begin_testcase_setup
