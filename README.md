@@ -9,6 +9,8 @@ Abstraction Layer *(also known as an API Gateway or API Middleware)*.
 Made available as an open-source project in 2015, its core values are
 high performance and extensibility.
 
+Cloud-native architecture is the design or plan for applications and services built specifically to exist in the cloud.
+
 Actively maintained, Kong is widely used in production at companies ranging
 from startups to Global 5000 as well as government organizations.
 
